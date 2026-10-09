@@ -1,0 +1,14 @@
+[Unit]
+Description=HOPE deadline notifier (Discord)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=__USER__
+WorkingDirectory=/home/__USER__/hope-notifier
+ExecStart=/home/__USER__/hope-notifier/hope-notifier
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

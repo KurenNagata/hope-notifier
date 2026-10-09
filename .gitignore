@@ -1,0 +1,15 @@
+# 秘密情報・実行時のデータ
+.env
+state.json
+reminders.json
+*.tmp
+
+# ビルド結果
+hope-notifier
+hope-notifier.exe
+hope-notifier-linux
+
+# 作業用・エディタ拡張が自動で作るファイル
+_to_delete/
+CLAUDE.md
+.claude/

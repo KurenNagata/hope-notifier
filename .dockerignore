@@ -1,0 +1,11 @@
+.env
+state.json
+reminders.json
+*.tmp
+*.exe
+hope-notifier
+hope-notifier-linux
+_to_delete
+CLAUDE.md
+.claude
+.git

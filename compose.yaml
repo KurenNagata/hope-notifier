@@ -1,0 +1,14 @@
+services:
+  hope-notifier:
+    build: .
+    env_file: .env
+    environment:
+      STATE_FILE: /data/state.json
+      TZ: Asia/Tokyo
+      REMINDERS_FILE: /data/reminders.json
+    volumes:
+      - hope-notifier-data:/data
+    restart: unless-stopped
+
+volumes:
+  hope-notifier-data:
