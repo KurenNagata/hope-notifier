@@ -17,6 +17,7 @@ type Config struct {
 	PollInterval   time.Duration   // HOPE を確認する間隔
 	RemindBefore   []time.Duration // 締切の何時間前に通知するか（大きい順）
 	DigestTime     string          // 毎朝の一覧を送る時刻 (HH:MM)。空なら送らない
+	NightTime      string          // 夜の一覧（今日の残り＋明日）を送る時刻 (HH:MM)。空なら送らない
 	StateFile      string          // 通知済みの記録を保存するファイル
 	Location       *time.Location  // 表示に使うタイムゾーン
 
@@ -89,14 +90,13 @@ func loadConfig() (*Config, error) {
 	}
 	sort.Slice(reminders, func(i, j int) bool { return reminders[i] > reminders[j] })
 
-	digest := getenv("DIGEST_TIME", "07:00")
-	if strings.EqualFold(digest, "off") {
-		digest = ""
+	digest, err := clockSetting("DIGEST_TIME", "07:00")
+	if err != nil {
+		return nil, err
 	}
-	if digest != "" {
-		if _, err := time.Parse("15:04", digest); err != nil {
-			return nil, fmt.Errorf("DIGEST_TIME は HH:MM 形式で指定してください（例: 07:00）")
-		}
+	night, err := clockSetting("NIGHT_DIGEST_TIME", "20:00")
+	if err != nil {
+		return nil, err
 	}
 
 	cfg := &Config{
@@ -106,6 +106,7 @@ func loadConfig() (*Config, error) {
 		PollInterval:   interval,
 		RemindBefore:   reminders,
 		DigestTime:     digest,
+		NightTime:      night,
 		StateFile:      getenv("STATE_FILE", "state.json"),
 		Location:       loc,
 
@@ -122,6 +123,18 @@ func loadConfig() (*Config, error) {
 		return nil, fmt.Errorf("DISCORD_BOT_TOKEN を使うときは REMIND_CHANNEL_ID も設定してください")
 	}
 	return cfg, nil
+}
+
+// clockSetting は HH:MM 形式の時刻を読む。"off" なら空文字（送らない）を返す。
+func clockSetting(key, def string) (string, error) {
+	v := getenv(key, def)
+	if strings.EqualFold(v, "off") {
+		return "", nil
+	}
+	if _, err := time.Parse("15:04", v); err != nil {
+		return "", fmt.Errorf("%s は HH:MM 形式で指定してください（例: %s）", key, def)
+	}
+	return v, nil
 }
 
 func (c *Config) validate(needDiscord bool) error {

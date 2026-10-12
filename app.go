@@ -25,8 +25,9 @@ type EventSource interface {
 type State struct {
 	// キー: "イベントID:締切(unix)"、値: 送信済みのリマインド（例: "24h0m0s"）
 	Sent         map[string][]string `json:"sent"`
-	LastDigest   string              `json:"last_digest"`   // 最後に一覧を送った日付 (YYYY-MM-DD)
-	TokenAlerted bool                `json:"token_alerted"` // トークン切れを通知済みか
+	LastDigest   string              `json:"last_digest"`       // 最後に朝の一覧を送った日付 (YYYY-MM-DD)
+	LastNight    string              `json:"last_night_digest"` // 最後に夜の一覧を送った日付 (YYYY-MM-DD)
+	TokenAlerted bool                `json:"token_alerted"`     // トークン切れを通知済みか
 }
 
 func loadState(path string) (*State, error) {
@@ -208,6 +209,10 @@ func (a *App) Tick(ctx context.Context) error {
 	if err := a.maybeDigest(ctx, now); err != nil {
 		return err
 	}
+	// 夜の一覧（今日の残り＋明日）
+	if err := a.maybeNightDigest(ctx, now); err != nil {
+		return err
+	}
 
 	a.state.prune(now)
 	return a.state.save(a.cfg.StateFile)
@@ -255,6 +260,73 @@ func (a *App) maybeDigest(ctx context.Context, now time.Time) error {
 	a.state.LastDigest = today
 	log.Printf("今日の締切一覧を送信 (%d 件)", len(events))
 	return nil
+}
+
+// maybeNightDigest は夜に、今日の残りと明日が締切の未対応の課題を送る。
+// 日中に課題が追加されることもあるため、1 件も無い日も「ありません」と送る。
+func (a *App) maybeNightDigest(ctx context.Context, now time.Time) error {
+	if a.cfg.NightTime == "" {
+		return nil
+	}
+	loc := a.cfg.Location
+	local := now.In(loc)
+	today := local.Format("2006-01-02")
+	if a.state.LastNight == today {
+		return nil
+	}
+	t, _ := time.Parse("15:04", a.cfg.NightTime)
+	at := time.Date(local.Year(), local.Month(), local.Day(), t.Hour(), t.Minute(), 0, 0, loc)
+	// 指定時刻から 3 時間以内に起動していれば送る
+	if local.Before(at) || local.After(at.Add(3*time.Hour)) {
+		return nil
+	}
+
+	endToday := time.Date(local.Year(), local.Month(), local.Day()+1, 0, 0, 0, 0, loc)    // 今日 24:00
+	endTomorrow := time.Date(local.Year(), local.Month(), local.Day()+2, 0, 0, 0, 0, loc) // 明日 24:00
+	events, err := a.pending(ctx, now, endTomorrow)
+	if err != nil {
+		return err
+	}
+	var todays, tomorrows []Event
+	for _, e := range events {
+		if e.Due().After(endToday) {
+			tomorrows = append(tomorrows, e)
+		} else {
+			todays = append(todays, e) // 24:00 締切は今日に含める
+		}
+	}
+
+	var b strings.Builder
+	if len(events) == 0 {
+		b.WriteString("今日の残りと明日が締切の未対応の課題はありません 🎉")
+	} else {
+		b.WriteString("**今日の締切（残り）**\n")
+		a.writeEventList(&b, todays)
+		fmt.Fprintf(&b, "\n**明日の締切（%s）**\n", endToday.Format("1/2")+weekdayJP(endToday))
+		a.writeEventList(&b, tomorrows)
+	}
+	msg := Message{
+		Title:       fmt.Sprintf("🌙 今夜の確認（%s）", local.Format("1/2")+weekdayJP(local)),
+		Description: b.String(),
+		URL:         a.cfg.MoodleURL + "/calendar/view.php?view=upcoming",
+		Color:       colorBlue,
+	}
+	if err := a.out.Send(ctx, msg); err != nil {
+		return err
+	}
+	a.state.LastNight = today
+	log.Printf("夜の締切一覧を送信 (今日 %d 件, 明日 %d 件)", len(todays), len(tomorrows))
+	return nil
+}
+
+func (a *App) writeEventList(b *strings.Builder, events []Event) {
+	if len(events) == 0 {
+		b.WriteString("なし\n")
+		return
+	}
+	for _, e := range events {
+		fmt.Fprintf(b, "• **%s** — %s\n　%s\n", a.formatDue(e.Due()), e.Name, courseName(e))
+	}
 }
 
 func (a *App) reminderMessage(e Event, remaining, hit time.Duration) Message {

@@ -112,8 +112,8 @@ func main() {
 				}
 			}()
 		}
-		log.Printf("開始: %s を %s ごとに確認します（通知: %v 前, 毎朝の一覧: %s）",
-			cfg.MoodleURL, cfg.PollInterval, cfg.RemindBefore, orOff(cfg.DigestTime))
+		log.Printf("開始: %s を %s ごとに確認します（通知: %v 前, 朝の一覧: %s, 夜の一覧: %s）",
+			cfg.MoodleURL, cfg.PollInterval, cfg.RemindBefore, orOff(cfg.DigestTime), orOff(cfg.NightTime))
 		runLoop(ctx, app, cfg.PollInterval)
 	default:
 		flag.Usage()

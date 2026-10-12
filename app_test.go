@@ -190,6 +190,76 @@ func TestDigestOncePerDay(t *testing.T) {
 	}
 }
 
+func nightMessages(msgs []Message) []Message {
+	var out []Message
+	for _, m := range msgs {
+		if strings.Contains(m.Title, "今夜の確認") {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func TestNightDigest(t *testing.T) {
+	loc, _ := time.LoadLocation("Asia/Tokyo")
+	src := &fakeSource{events: []Event{
+		ev(1, "締切済みの課題", time.Date(2026, 10, 12, 18, 0, 0, 0, loc), 100), // もう過ぎている
+		ev(2, "今夜の課題", time.Date(2026, 10, 12, 23, 59, 0, 0, loc), 200),
+		ev(3, "今日24時の課題", time.Date(2026, 10, 13, 0, 0, 0, 0, loc), 300), // 今日に含める
+		ev(4, "明日の課題", time.Date(2026, 10, 13, 17, 0, 0, 0, loc), 400),
+		ev(5, "明日24時の課題", time.Date(2026, 10, 14, 0, 0, 0, 0, loc), 500), // 明日に含める
+		ev(6, "あさっての課題", time.Date(2026, 10, 14, 9, 0, 0, 0, loc), 600),  // 含めない
+	}, completed: map[int]bool{}}
+	now := time.Date(2026, 10, 12, 19, 59, 0, 0, loc)
+	app, rec := newTestApp(t, src, &now, "")
+	app.cfg.NightTime = "20:00"
+	ctx := context.Background()
+
+	_ = app.Tick(ctx)
+	if n := nightMessages(rec.msgs); len(n) != 0 {
+		t.Fatalf("night digest too early: %+v", n)
+	}
+	now = time.Date(2026, 10, 12, 20, 3, 0, 0, loc)
+	_ = app.Tick(ctx)
+	n := nightMessages(rec.msgs)
+	if len(n) != 1 {
+		t.Fatalf("want 1 night digest, got %+v", n)
+	}
+	today, tomorrow, ok := strings.Cut(n[0].Description, "明日の締切（10/13(火)）")
+	if !ok {
+		t.Fatalf("no tomorrow section:\n%s", n[0].Description)
+	}
+	if !strings.Contains(today, "今夜の課題") || !strings.Contains(today, "今日24時の課題") ||
+		strings.Contains(today, "締切済み") || strings.Contains(today, "明日の課題") {
+		t.Errorf("today section wrong:\n%s", today)
+	}
+	if !strings.Contains(tomorrow, "明日の課題") || !strings.Contains(tomorrow, "明日24時の課題") ||
+		strings.Contains(tomorrow, "あさって") {
+		t.Errorf("tomorrow section wrong:\n%s", tomorrow)
+	}
+
+	now = time.Date(2026, 10, 12, 21, 0, 0, 0, loc)
+	_ = app.Tick(ctx)
+	if n := nightMessages(rec.msgs); len(n) != 1 {
+		t.Fatal("night digest sent twice")
+	}
+}
+
+func TestNightDigestSendsEvenWhenEmpty(t *testing.T) {
+	loc, _ := time.LoadLocation("Asia/Tokyo")
+	src := &fakeSource{completed: map[int]bool{}}
+	now := time.Date(2026, 10, 12, 20, 0, 0, 0, loc)
+	app, rec := newTestApp(t, src, &now, "")
+	app.cfg.NightTime = "20:00"
+	if err := app.Tick(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	n := nightMessages(rec.msgs)
+	if len(n) != 1 || !strings.Contains(n[0].Description, "ありません") {
+		t.Fatalf("want empty night digest, got %+v", n)
+	}
+}
+
 func TestTokenExpiryAlertOnce(t *testing.T) {
 	src := &fakeSource{tokenErr: true}
 	now := time.Now()
