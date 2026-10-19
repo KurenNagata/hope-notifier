@@ -278,3 +278,54 @@ func TestDropRemovesReminder(t *testing.T) {
 		t.Fatalf("fire with failing sender should report not sent")
 	}
 }
+
+func TestSnoozeWithoutReply(t *testing.T) {
+	loc, _ := time.LoadLocation("Asia/Tokyo")
+	now := time.Date(2026, 10, 19, 9, 0, 0, 0, loc)
+	r := newRem(t, &now)
+
+	// 通知が無いときのスヌーズ
+	if got := r.Handle("u1", "c1", "スヌーズ", ""); !strings.Contains(got, "スヌーズできる通知がありません") {
+		t.Fatalf("no fired: %q", got)
+	}
+
+	r.Items = []Reminder{{ID: 1, UserID: "u1", ChannelID: "c1", Content: "企業実習", At: now}}
+	rec := &chatRec{}
+	if _, err := r.fire(context.Background(), rec, r.Items[0]); err != nil {
+		t.Fatal(err)
+	}
+
+	// 返信なしで「スヌーズ」→ 10 分後
+	now = now.Add(2 * time.Minute)
+	if got := r.Handle("u1", "c1", "スヌーズ", ""); !strings.Contains(got, "🔁 10/19(月) 09:12 にもう一度「企業実習」") {
+		t.Fatalf("snooze: %q", got)
+	}
+	// 同じ通知への 2 回目は返信なしでは受け付けない
+	if got := r.Handle("u1", "c1", "30分後", ""); strings.Contains(got, "もう一度") {
+		t.Fatalf("double snooze: %q", got)
+	}
+	r.Handle("u1", "c1", "キャンセル", "")
+
+	// 「スヌーズ 30分」
+	it := r.Items[0]
+	now = it.At
+	if _, err := r.fire(context.Background(), &chatRec{}, it); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.Handle("u2", "c1", "スヌーズ 30分", ""); !strings.Contains(got, "09:42") {
+		t.Fatalf("snooze 30: %q", got)
+	}
+
+	// 別チャンネル・30 分を過ぎたら効かない
+	r.Items = []Reminder{{ID: 9, UserID: "u1", ChannelID: "c1", Content: "会議", At: now}}
+	if _, err := r.fire(context.Background(), &chatRec{}, r.Items[0]); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.Handle("u1", "c2", "10分後", ""); strings.Contains(got, "もう一度") {
+		t.Fatalf("other channel: %q", got)
+	}
+	now = now.Add(31 * time.Minute)
+	if got := r.Handle("u1", "c1", "10分後", ""); strings.Contains(got, "もう一度") {
+		t.Fatalf("after window: %q", got)
+	}
+}

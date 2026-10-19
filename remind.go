@@ -40,8 +40,10 @@ type draft struct {
 // firedMsg は送った通知メッセージ。返信で「10分後」と言われたときに内容を思い出すために覚えておく。
 type firedMsg struct {
 	MessageID string    `json:"message_id"`
+	ChannelID string    `json:"channel_id,omitempty"`
 	Content   string    `json:"content"`
 	SentAt    time.Time `json:"sent_at"`
+	Snoozed   bool      `json:"snoozed,omitempty"` // 返信なしのスヌーズを受け付けたか（二重予約を防ぐ）
 }
 
 // Reminders は会話の受け付け・予約の保存・時刻ちょうどの送信を担当する。
@@ -65,7 +67,62 @@ const (
 	maxFired = 200
 	// 送れない予約（チャンネル削除など）で後ろの予約が止まらないよう、この回数で諦める
 	maxSendAttempts = 5
+	// 通知のあと、返信しなくても「10分後」「スヌーズ」でもう一度知らせられる時間
+	snoozeWindow = 30 * time.Minute
 )
+
+var reBareDuration = regexp.MustCompile(`^\d+(?:分|時間|時間半)$`)
+
+// snoozeWhen はスヌーズの言葉を時刻の指定に直す。「スヌーズ」だけなら 10 分後。
+// スヌーズの言葉でなければ ok=false。
+func snoozeWhen(norm string) (when string, ok bool) {
+	s := strings.TrimRight(norm, "。．.!！ 　")
+	switch s {
+	case "スヌーズ", "すぬーず", "snooze", "もう一度", "もういちど", "あとで", "後で":
+		return "10分後", true
+	}
+	for _, p := range []string{"スヌーズ", "すぬーず", "snooze"} {
+		if strings.HasPrefix(s, p) {
+			rest := strings.TrimSpace(strings.TrimPrefix(s, p))
+			if reBareDuration.MatchString(rest) { // 「スヌーズ 30分」→ 30分後
+				rest += "後"
+			}
+			return rest, true
+		}
+	}
+	return "", false
+}
+
+// snoozeLocked は通知 f の内容を when にもう一度知らせる予約を入れ、返信文を返す。
+func (r *Reminders) snoozeLocked(userID, channelID string, f firedMsg, when string, now time.Time) (string, bool) {
+	at, err := ParseWhen(when, now, r.loc)
+	if err != nil {
+		return fmt.Sprintf("⚠️ もう一度知らせる時刻を読み取れませんでした。\n%s", examples), false
+	}
+	if !at.After(now) {
+		return fmt.Sprintf("⚠️ %s はもう過ぎています。", r.fmtTime(at)), false
+	}
+	it, err := r.addLocked(userID, channelID, f.Content, at)
+	if err != nil {
+		log.Printf("予約の保存に失敗: %v", err)
+		return "⚠️ 予約を保存できませんでした。もう一度試してください。", false
+	}
+	return fmt.Sprintf("🔁 %s にもう一度「%s」をお知らせします（番号: %d）", r.fmtTime(at), f.Content, it.ID), true
+}
+
+// recentFiredLocked は、そのチャンネルで最後に送った通知が snoozeWindow 以内でまだスヌーズされていなければ、その位置を返す。
+func (r *Reminders) recentFiredLocked(channelID string, now time.Time) int {
+	for i, f := range r.Fired {
+		if f.ChannelID != channelID {
+			continue
+		}
+		if f.Snoozed || now.Sub(f.SentAt) > snoozeWindow {
+			return -1
+		}
+		return i
+	}
+	return -1
+}
 
 var (
 	reDelete  = regexp.MustCompile(`^(?:削除|取り消し|取消|キャンセル|cancel|del)\s*[#＃]?\s*(\d+)$`)
@@ -209,27 +266,39 @@ func (r *Reminders) Handle(userID, channelID, text, replyToMessageID string) str
 			if f.MessageID != replyToMessageID {
 				continue
 			}
-			when := text
-			switch norm {
-			case "スヌーズ", "もう一度", "もういちど", "あとで", "後で", "snooze":
-				when = "10分後"
-			}
 			if isCancel(text) || norm == "ok" || norm == "了解" || norm == "おけ" {
 				return ""
 			}
-			at, err := ParseWhen(when, now, r.loc)
-			if err != nil {
-				return fmt.Sprintf("⚠️ もう一度知らせる時刻を読み取れませんでした。\n%s", examples)
+			when, ok := snoozeWhen(norm)
+			if !ok {
+				when = text
 			}
-			if !at.After(now) {
-				return fmt.Sprintf("⚠️ %s はもう過ぎています。", r.fmtTime(at))
+			reply, _ := r.snoozeLocked(userID, channelID, f, when, now)
+			return reply
+		}
+	}
+
+	// 返信しなくても、通知の直後（snoozeWindow 以内）なら「スヌーズ」「10分後」でもう一度知らせる
+	if replyToMessageID == "" && !waiting {
+		if i := r.recentFiredLocked(channelID, now); i >= 0 {
+			when, ok := snoozeWhen(norm)
+			if !ok {
+				if _, err := ParseWhen(text, now, r.loc); err == nil {
+					when, ok = text, true
+				}
 			}
-			it, err := r.addLocked(userID, channelID, f.Content, at)
-			if err != nil {
-				log.Printf("予約の保存に失敗: %v", err)
-				return "⚠️ 予約を保存できませんでした。もう一度試してください。"
+			if ok {
+				reply, done := r.snoozeLocked(userID, channelID, r.Fired[i], when, now)
+				if done {
+					r.Fired[i].Snoozed = true
+					if err := r.saveLocked(); err != nil {
+						log.Printf("予約の保存に失敗: %v", err)
+					}
+				}
+				return reply
 			}
-			return fmt.Sprintf("🔁 %s にもう一度「%s」をお知らせします（番号: %d）", r.fmtTime(at), f.Content, it.ID)
+		} else if _, ok := snoozeWhen(norm); ok {
+			return "スヌーズできる通知がありません（通知から30分以内か、通知に返信して送ってください）。"
 		}
 	}
 
@@ -299,7 +368,7 @@ func (r *Reminders) Handle(userID, channelID, text, replyToMessageID string) str
 				"・1回で予約: 明日9時にレポート\n" +
 				"・時刻: " + examples + "\n" +
 				"・やめる: キャンセル\n・確認: 一覧\n・取り消し: 削除 番号\n・時刻の変更: 変更 番号 明日の10時\n" +
-				"・もう一度知らせる: 通知に返信して「10分後」\n・HOPE の未提出: 課題"
+				"・もう一度知らせる: 通知のあと30分以内に「スヌーズ」（10分後）や「30分後」（それ以降は通知に返信して送る）\n・HOPE の未提出: 課題"
 		}
 	}
 
@@ -434,7 +503,7 @@ func (r *Reminders) fire(ctx context.Context, out ChatSender, it Reminder) (sent
 	for _, id := range ids {
 		tags = append(tags, "<@"+id+">")
 	}
-	text := fmt.Sprintf("%s ⏰ 「%s」の時間です", strings.Join(tags, " "), it.Content)
+	text := fmt.Sprintf("%s ⏰ 「%s」の時間です\n（もう一度知らせるときは「スヌーズ」や「30分後」と送ってください）", strings.Join(tags, " "), it.Content)
 	if late := r.now().Sub(it.At); late > 2*time.Minute {
 		text += fmt.Sprintf("\n（%s の予定でしたが、Bot が止まっていたため遅れて通知しています）", r.fmtTime(it.At))
 	}
@@ -451,7 +520,7 @@ func (r *Reminders) fire(ctx context.Context, out ChatSender, it Reminder) (sent
 		}
 	}
 	if msgID != "" {
-		r.Fired = append([]firedMsg{{MessageID: msgID, Content: it.Content, SentAt: r.now()}}, r.Fired...)
+		r.Fired = append([]firedMsg{{MessageID: msgID, ChannelID: it.ChannelID, Content: it.Content, SentAt: r.now()}}, r.Fired...)
 		if len(r.Fired) > maxFired {
 			r.Fired = r.Fired[:maxFired]
 		}

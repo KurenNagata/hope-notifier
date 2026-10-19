@@ -19,6 +19,7 @@ var (
 	reRelative = regexp.MustCompile(`^(?:(\d+)日)?(?:(\d+)時間)?(?:(\d+)分)?後$`)
 	reYMD      = regexp.MustCompile(`^(\d{4})[/年-](\d{1,2})[/月-](\d{1,2})日?`)
 	reMD       = regexp.MustCompile(`^(\d{1,2})[/月](\d{1,2})日?`)
+	reDay      = regexp.MustCompile(`^(\d{1,2})日`)
 	reWeekday  = regexp.MustCompile(`^(来週|今週)?([月火水木金土日])曜日?`)
 	reClock    = regexp.MustCompile(`^(\d{1,2}):(\d{2})$`)
 	reJPTime   = regexp.MustCompile(`^(\d{1,2})時(?:(\d{1,2})分|半)?$`)
@@ -104,6 +105,25 @@ func ParseWhen(input string, now time.Time, loc *time.Location) (time.Time, erro
 			}
 			if date.Before(today) { // 過ぎた日付は来年
 				date = date.AddDate(1, 0, 0)
+			}
+			hasDate, s = true, s[len(m[0]):]
+		} else if m := reDay.FindStringSubmatch(s); m != nil {
+			// 「19日」のように月を省いた日付: 今月のその日（過ぎていれば、その日がある次の月）
+			d, _ := strconv.Atoi(m[1])
+			if d < 1 || d > 31 {
+				return time.Time{}, fmt.Errorf("%d日 は存在しない日付です", d)
+			}
+			found := false
+			for i := 0; i < 12; i++ {
+				first := time.Date(now.Year(), now.Month()+time.Month(i), 1, 0, 0, 0, 0, loc)
+				c := time.Date(first.Year(), first.Month(), d, 0, 0, 0, 0, loc)
+				if c.Month() == first.Month() && !c.Before(today) {
+					date, found = c, true
+					break
+				}
+			}
+			if !found {
+				return time.Time{}, fmt.Errorf("%d日 は存在しない日付です", d)
 			}
 			hasDate, s = true, s[len(m[0]):]
 		} else if m := reWeekday.FindStringSubmatch(s); m != nil {
