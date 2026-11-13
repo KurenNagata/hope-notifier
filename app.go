@@ -28,6 +28,11 @@ type State struct {
 	LastDigest   string              `json:"last_digest"`       // 最後に朝の一覧を送った日付 (YYYY-MM-DD)
 	LastNight    string              `json:"last_night_digest"` // 最後に夜の一覧を送った日付 (YYYY-MM-DD)
 	TokenAlerted bool                `json:"token_alerted"`     // トークン切れを通知済みか
+
+	// 新しい課題・小テストの検知（items.go）
+	KnownCourses map[int]bool    `json:"known_courses"` // 見たことのあるコース ID
+	KnownItems   map[string]bool `json:"known_items"`   // 見たことのある課題・小テスト（"assign:ID" / "quiz:ID"）
+	LastScan     int64           `json:"last_scan"`     // 最後に新しい課題を探した時刻 (unix)
 }
 
 func loadState(path string) (*State, error) {
@@ -91,13 +96,15 @@ func (s *State) prune(now time.Time) {
 }
 
 type App struct {
-	mu     sync.Mutex // AssignmentsText を複数のメッセージから同時に呼ばれても安全にする
-	cfg    *Config
-	src    EventSource
-	out    Notifier
-	state  *State
-	userID int
-	now    func() time.Time
+	mu       sync.Mutex // AssignmentsText を複数のメッセージから同時に呼ばれても安全にする
+	cfg      *Config
+	src      EventSource
+	items    ItemSource     // nil なら新しい課題の検知と、読み取った締切は使わない
+	inferred *InferredStore // 読み取った締切（Bot と共有）
+	out      Notifier
+	state    *State
+	userID   int
+	now      func() time.Time
 }
 
 func eventKey(e Event) string { return fmt.Sprintf("%d:%d", e.ID, e.TimeSort) }
@@ -116,6 +123,13 @@ func (a *App) pending(ctx context.Context, from, to time.Time) ([]Event, error) 
 	if err != nil {
 		return nil, err
 	}
+
+	// 説明文から読み取った締切（HOPE 上の締切が未設定の課題）も対象に加える
+	extra, err := a.inferredEvents(ctx, from, to, events)
+	if err != nil {
+		return nil, err
+	}
+	events = append(events, extra...)
 
 	// アンケートなど、回答済みでもタイムラインに残る活動があるため、完了状態でも除外する
 	completed := map[int]map[int]bool{}
@@ -150,6 +164,9 @@ func (a *App) Tick(ctx context.Context) error {
 	if len(a.cfg.RemindBefore) > 0 && a.cfg.RemindBefore[0] > maxAhead {
 		maxAhead = a.cfg.RemindBefore[0]
 	}
+
+	// 新しい課題・小テストの確認（1 時間おき。失敗しても締切通知は続ける）
+	a.maybeScanItems(ctx, now)
 
 	events, err := a.pending(ctx, now, now.Add(maxAhead+time.Hour))
 	if err != nil {
@@ -215,6 +232,9 @@ func (a *App) Tick(ctx context.Context) error {
 	}
 
 	a.state.prune(now)
+	if err := a.inferred.Prune(now); err != nil {
+		log.Printf("推定締切の保存に失敗: %v", err)
+	}
 	return a.state.save(a.cfg.StateFile)
 }
 

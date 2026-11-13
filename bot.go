@@ -25,7 +25,8 @@ func (d discordSender) Send(_ context.Context, channelID, text string, mentionUs
 
 // startBot は Discord Bot に接続し、指定チャンネルのメッセージに応答する。ctx が終わるまで戻らない。
 // assignments は「課題」と送られたときの返事を作る関数（nil なら使わない）。
-func startBot(ctx context.Context, cfg *Config, rem *Reminders, assignments func(context.Context) string) error {
+// inferredCmd は「推定一覧」「推定削除 番号」の返事を作る関数（対象のメッセージでなければ ok=false。nil なら使わない）。
+func startBot(ctx context.Context, cfg *Config, rem *Reminders, assignments func(context.Context) string, inferredCmd func(string) (string, bool)) error {
 	s, err := discordgo.New("Bot " + cfg.BotToken)
 	if err != nil {
 		return err
@@ -43,7 +44,13 @@ func startBot(ctx context.Context, cfg *Config, rem *Reminders, assignments func
 			return
 		}
 		var reply string
-		if assignments != nil && isAssignmentsCommand(m.Content) {
+		inferredReply, isInferred := "", false
+		if inferredCmd != nil {
+			inferredReply, isInferred = inferredCmd(m.Content)
+		}
+		if isInferred {
+			reply = inferredReply
+		} else if assignments != nil && isAssignmentsCommand(m.Content) {
 			_ = s.ChannelTyping(m.ChannelID)
 			c, cancel := context.WithTimeout(ctx, time.Minute)
 			reply = assignments(c)
