@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -32,12 +33,16 @@ const usage = `使い方:
 オプション:
   -env <path>   設定ファイル（既定: .env）
   -dry-run      Discord に送らず画面に表示する
+  -check-api    新しい課題の検知に使う HOPE の API が呼べるか確認する
+  -preview-new N  最近の課題・小テスト N 件の通知文と読み取った締切を表示する（何も書き換えない）
 `
 
 func main() {
 	log.SetFlags(log.LstdFlags)
 	envPath := flag.String("env", ".env", "設定ファイル")
 	dryRun := flag.Bool("dry-run", false, "Discord に送らず画面に表示する")
+	checkAPI := flag.Bool("check-api", false, "新しい課題の検知に使う HOPE の API が呼べるか確認する（通知はしない）")
+	previewNew := flag.Int("preview-new", 0, "最近の課題・小テスト N 件の通知文と読み取った締切を表示する（状態ファイルは書き換えない）")
 	flag.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	flag.Parse()
 
@@ -57,7 +62,7 @@ func main() {
 		return
 	}
 
-	needDiscord := !*dryRun && cmd != "preview"
+	needDiscord := !*dryRun && cmd != "preview" && !*checkAPI && *previewNew <= 0
 	if err := cfg.validate(needDiscord); err != nil {
 		log.Fatal(err)
 	}
@@ -71,6 +76,20 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if *checkAPI {
+		if !runCheckAPI(ctx, src, cfg.MoodleToken) {
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *previewNew > 0 {
+		if err := previewNewItems(ctx, os.Stdout, cfg, src, *previewNew, time.Now()); err != nil {
+			log.Fatal(sanitizeErr(err, cfg.MoodleToken))
+		}
+		return
+	}
 
 	switch cmd {
 	case "test":
@@ -91,7 +110,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	app := &App{cfg: cfg, src: src, out: out, state: state, now: time.Now}
+	// 読み取った締切は、締切通知と Bot で同じストアを共有する
+	inferred, err := LoadInferredStore(filepath.Join(filepath.Dir(cfg.StateFile), "inferred.json"))
+	if err != nil {
+		log.Fatal(err)
+	}
+	app := &App{cfg: cfg, src: src, items: src, out: out, state: state, now: time.Now, inferred: inferred}
 
 	switch cmd {
 	case "once":
@@ -104,10 +128,11 @@ func main() {
 			if err != nil {
 				log.Fatal(err)
 			}
-			lister := &App{cfg: cfg, src: src, state: &State{Sent: map[string][]string{}}, now: time.Now}
+			lister := &App{cfg: cfg, src: src, items: src, inferred: inferred, state: &State{Sent: map[string][]string{}}, now: time.Now}
 			assignments := func(c context.Context) string { return lister.AssignmentsText(c) }
+			inferredCmd := func(text string) (string, bool) { return lister.InferredCommand(text) }
 			go func() {
-				if err := startBot(ctx, cfg, rem, assignments); err != nil {
+				if err := startBot(ctx, cfg, rem, assignments, inferredCmd); err != nil {
 					log.Printf("Discord Bot を起動できません: %v", err)
 				}
 			}()

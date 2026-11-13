@@ -2,6 +2,7 @@
 .env
 state.json
 reminders.json
+inferred.json
 *.tmp
 
 # ビルド結果

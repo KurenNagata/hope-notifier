@@ -184,3 +184,161 @@ func (c *MoodleClient) CompletedCMIDs(ctx context.Context, courseID, userID int)
 	}
 	return done, nil
 }
+
+// Course は履修中のコース。
+type Course struct {
+	ID        int    `json:"id"`
+	FullName  string `json:"fullname"`
+	ShortName string `json:"shortname"`
+}
+
+func (c Course) Name() string {
+	if c.FullName != "" {
+		return c.FullName
+	}
+	return c.ShortName
+}
+
+// Item は課題（assign）または小テスト（quiz）の 1 件。
+type Item struct {
+	Kind       string // "assign" または "quiz"
+	ID         int    // 課題 ID / 小テスト ID（課題と小テストで番号が重なるので Kind と組で使う）
+	CMID       int    // コースモジュール ID（URL の id）
+	CourseID   int
+	CourseName string
+	Name       string
+	Intro      string // 説明文（HTML）
+	Due        int64  // HOPE 上の締切（課題: duedate, 小テスト: timeclose）。0 は未設定
+	Open       int64  // 提出・受験の開始（課題: allowsubmissionsfromdate, 小テスト: timeopen）
+	Modified   int64  // 作成・更新日時（timemodified）
+}
+
+func (it Item) Key() string { return fmt.Sprintf("%s:%d", it.Kind, it.ID) }
+
+// URL は HOPE 上のページ。
+func (it Item) URL(base string) string {
+	return fmt.Sprintf("%s/mod/%s/view.php?id=%d", base, it.Kind, it.CMID)
+}
+
+func (it Item) KindLabel() string {
+	if it.Kind == "quiz" {
+		return "小テスト"
+	}
+	return "課題"
+}
+
+func courseIDParams(p url.Values, ids []int) {
+	for i, id := range ids {
+		p.Set(fmt.Sprintf("courseids[%d]", i), strconv.Itoa(id))
+	}
+}
+
+// EnrolledCourses は履修中のコースを返す。
+func (c *MoodleClient) EnrolledCourses(ctx context.Context, userID int) ([]Course, error) {
+	p := url.Values{}
+	p.Set("userid", strconv.Itoa(userID))
+	var res []Course
+	if err := c.call(ctx, "core_enrol_get_users_courses", p, &res); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// Assignments はコース内の課題の一覧を返す。
+func (c *MoodleClient) Assignments(ctx context.Context, courseIDs []int) ([]Item, error) {
+	p := url.Values{}
+	courseIDParams(p, courseIDs)
+	var res struct {
+		Courses []struct {
+			ID          int `json:"id"`
+			Assignments []struct {
+				ID           int    `json:"id"`
+				CMID         int    `json:"cmid"`
+				Name         string `json:"name"`
+				Intro        string `json:"intro"`
+				DueDate      int64  `json:"duedate"`
+				AllowFrom    int64  `json:"allowsubmissionsfromdate"`
+				TimeModified int64  `json:"timemodified"`
+			} `json:"assignments"`
+		} `json:"courses"`
+	}
+	if err := c.call(ctx, "mod_assign_get_assignments", p, &res); err != nil {
+		return nil, err
+	}
+	var out []Item
+	for _, co := range res.Courses {
+		for _, a := range co.Assignments {
+			out = append(out, Item{Kind: "assign", ID: a.ID, CMID: a.CMID, CourseID: co.ID, Name: a.Name,
+				Intro: a.Intro, Due: a.DueDate, Open: a.AllowFrom, Modified: a.TimeModified})
+		}
+	}
+	return out, nil
+}
+
+// Quizzes はコース内の小テストの一覧を返す。
+func (c *MoodleClient) Quizzes(ctx context.Context, courseIDs []int) ([]Item, error) {
+	p := url.Values{}
+	courseIDParams(p, courseIDs)
+	var res struct {
+		Quizzes []struct {
+			ID           int    `json:"id"`
+			CMID         int    `json:"coursemodule"`
+			Course       int    `json:"course"`
+			Name         string `json:"name"`
+			Intro        string `json:"intro"`
+			TimeOpen     int64  `json:"timeopen"`
+			TimeClose    int64  `json:"timeclose"`
+			TimeModified int64  `json:"timemodified"`
+		} `json:"quizzes"`
+	}
+	if err := c.call(ctx, "mod_quiz_get_quizzes_by_courses", p, &res); err != nil {
+		return nil, err
+	}
+	var out []Item
+	for _, q := range res.Quizzes {
+		out = append(out, Item{Kind: "quiz", ID: q.ID, CMID: q.CMID, CourseID: q.Course, Name: q.Name,
+			Intro: q.Intro, Due: q.TimeClose, Open: q.TimeOpen, Modified: q.TimeModified})
+	}
+	return out, nil
+}
+
+// AssignSubmitted は課題を提出済みかどうか。
+func (c *MoodleClient) AssignSubmitted(ctx context.Context, assignID, userID int) (bool, error) {
+	p := url.Values{}
+	p.Set("assignid", strconv.Itoa(assignID))
+	p.Set("userid", strconv.Itoa(userID))
+	var res struct {
+		LastAttempt struct {
+			Submission *struct {
+				Status string `json:"status"`
+			} `json:"submission"`
+		} `json:"lastattempt"`
+	}
+	if err := c.call(ctx, "mod_assign_get_submission_status", p, &res); err != nil {
+		return false, err
+	}
+	s := res.LastAttempt.Submission
+	return s != nil && s.Status == "submitted", nil
+}
+
+// QuizAttempted は小テストを受験済み（終了した受験がある）かどうか。
+func (c *MoodleClient) QuizAttempted(ctx context.Context, quizID, userID int) (bool, error) {
+	p := url.Values{}
+	p.Set("quizid", strconv.Itoa(quizID))
+	p.Set("userid", strconv.Itoa(userID))
+	p.Set("status", "all")
+	var res struct {
+		Attempts []struct {
+			State string `json:"state"`
+		} `json:"attempts"`
+	}
+	if err := c.call(ctx, "mod_quiz_get_user_attempts", p, &res); err != nil {
+		return false, err
+	}
+	for _, a := range res.Attempts {
+		if a.State == "finished" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
